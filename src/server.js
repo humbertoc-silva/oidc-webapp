@@ -45,12 +45,13 @@ app.get('/profile', (req, res) => {
 app.get('/login', (req, res) => {
   // define constants for the authorization request
   const authorizationEndpoint = oidcProviderInfo['authorization_endpoint'];
-  const responseType = 'id_token';
-  const scope = 'openid profile email';
+  const responseType = 'code';
+  const scope = 'openid profile email read:to-dos';
   const clientID = process.env.CLIENT_ID;
   const redirectURI = 'http://localhost:3000/callback';
-  const responseMode = 'form_post';
+  const responseMode = 'query';
   const nonce = crypto.randomBytes(16).toString('hex');
+  const audience = process.env.API_IDENTIFIER;
 
   // define a signed cookie containing the nonce value
   const options = {
@@ -75,68 +76,117 @@ app.get('/login', (req, res) => {
         '&redirect_uri=' +
         redirectURI +
         '&nonce=' +
-        nonce
+        nonce +
+        '&audience=' +
+        audience
     );
 });
 
-app.post('/callback', async (req, res) => {
-  // take nonce from cookie
-  const nonce = req.cookies[nonceCookie];
+app.get('/callback', async (req, res) => {
+  const { code } = req.query;
 
-  // delete nonce
+  const codeExchangeOptions = {
+    grant_type: 'authorization_code',
+    client_id: process.env.CLIENT_ID,
+    client_secret: process.env.CLIENT_SECRET,
+    code: code,
+    redirect_uri: 'http://localhost:3000/callback'
+  };
+
+  const codeExchangeResponse = await request.post(
+    `https://${process.env.OIDC_PROVIDER}/oauth/token`,
+    { form: codeExchangeOptions }
+  );
+
+  // parse response to get tokens
+  const tokens = JSON.parse(codeExchangeResponse);
+  req.session.accessToken = tokens.access_token;
+
+  // extract nonce from cookie
+  const nonce = req.cookies[nonceCookie];
   delete req.cookies[nonceCookie];
 
-  // take ID Token posted by the user
-  const { id_token } = req.body;
+  try {
+    req.session.decodedIdToken = validateIDToken(tokens.id_token, nonce);
+    req.session.idToken = tokens.id_token;
 
-  // decode token
-  const decodedToken = jwt.decode(id_token, { complete: true });
-
-  // get key id
-  const kid = decodedToken.header.kid;
-
-  // get public key
-  const client = jwksClient({
-    jwksUri: oidcProviderInfo['jwks_uri']
-  });
-
-  client.getSigningKey(kid, (err, key) => {
-    const signingKey = key.publicKey || key.rsaPublicKey;
-
-    // verify signature and decode token
-    const verifiedToken = jwt.verify(id_token, signingKey);
-
-    // check audience, nonce, and expiration time
-    const {
-      nonce: decodedNonce,
-      aud: audience,
-      exp: expirationDate,
-      iss: issuer
-    } = verifiedToken;
-
-    const currentTime = Math.floor(Date.now() / 1000);
-    const expectedAudience = process.env.CLIENT_ID;
-
-    if (
-      audience !== expectedAudience ||
-      decodedNonce !== nonce ||
-      expirationDate < currentTime ||
-      issuer !== oidcProviderInfo['issuer']
-    ) {
-      // send and unauthorized http status
-      return res.status(401).send();
-    }
-
-    req.session.decodedIdToken = verifiedToken;
-    req.session.idToken = id_token;
-
-    // send the decoded version of the ID Token
-    res.redirect('profile');
-  });
+    res.redirect('/profile');
+  } catch (error) {
+    res.status(401).send();
+  }
 });
 
+// app.post('/callback', async (req, res) => {
+//   // take nonce from cookie
+//   const nonce = req.cookies[nonceCookie];
+
+//   // delete nonce
+//   delete req.cookies[nonceCookie];
+
+//   // take ID Token posted by the user
+//   const { id_token } = req.body;
+
+//   // decode token
+//   const decodedToken = jwt.decode(id_token, { complete: true });
+
+//   // get key id
+//   const kid = decodedToken.header.kid;
+
+//   // get public key
+//   const client = jwksClient({
+//     jwksUri: oidcProviderInfo['jwks_uri']
+//   });
+
+//   client.getSigningKey(kid, (err, key) => {
+//     const signingKey = key.publicKey || key.rsaPublicKey;
+
+//     // verify signature and decode token
+//     const verifiedToken = jwt.verify(id_token, signingKey);
+
+//     // check audience, nonce, and expiration time
+//     const {
+//       nonce: decodedNonce,
+//       aud: audience,
+//       exp: expirationDate,
+//       iss: issuer
+//     } = verifiedToken;
+
+//     const currentTime = Math.floor(Date.now() / 1000);
+//     const expectedAudience = process.env.CLIENT_ID;
+
+//     if (
+//       audience !== expectedAudience ||
+//       decodedNonce !== nonce ||
+//       expirationDate < currentTime ||
+//       issuer !== oidcProviderInfo['issuer']
+//     ) {
+//       // send and unauthorized http status
+//       return res.status(401).send();
+//     }
+
+//     req.session.decodedIdToken = verifiedToken;
+//     req.session.idToken = id_token;
+
+//     // send the decoded version of the ID Token
+//     res.redirect('profile');
+//   });
+// });
+
 app.get('/to-dos', async (req, res) => {
-  res.status(501).send();
+  const delegatedRequestOptions = {
+    url: 'http://localhost:3001',
+    headers: {
+      Authorization: `Bearer ${req.session.accessToken}`
+    }
+  };
+
+  try {
+    const delegatedResponse = await request(delegatedRequestOptions);
+    const toDos = JSON.parse(delegatedResponse);
+    res.render('to-dos', { toDos });
+  } catch (error) {
+    res.status(error.statusCode).send(error);
+  }
 });
 
 app.get('/remove-to-do/:id', async (req, res) => {
@@ -158,3 +208,29 @@ request(discoveryEndpoint)
     console.error(`Unable to get OIDC endpoints for ${OIDC_PROVIDER}`);
     process.exit(1);
   });
+
+function validateIDToken(idToken, nonce) {
+  const decodedIDToken = jwt.decode(idToken);
+
+  // fetch ID tokens details
+  const {
+    nonce: decodedNonce,
+    aud: audience,
+    exp: expirationDate,
+    iss: issuer
+  } = decodedIDToken;
+  const currentTime = Math.floor(Date.now() / 1000);
+  const expectedAudience = process.env.CLIENT_ID;
+
+  // validate ID tokens
+  if (
+    audience != expectedAudience ||
+    decodedNonce != nonce ||
+    expirationDate < currentTime ||
+    issuer !== oidcProviderInfo['issuer']
+  ) {
+    throw Error();
+  }
+
+  return decodedIDToken;
+}
